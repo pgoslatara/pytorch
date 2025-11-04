@@ -281,7 +281,7 @@ class StaticallyLaunchedTritonKernel:
                 if has_scratch:
                     arg_tys = arg_tys + "O"
                     args = (*args, None)
-        
+        # pyrefly: ignore [bad-argument-type]
         assert len(args) == len(arg_tys)
 
         # TODO: can handle grid functions here or in C++, so
@@ -340,7 +340,7 @@ class StaticallyLaunchedXpuKernel(StaticallyLaunchedTritonKernel):
 def statically_launched_kernel_by_device(
     kernel: CompiledKernel, device_type: str = "cuda"
 ) -> StaticallyLaunchedTritonKernel:
-    if device_type in ("cuda","hip"):
+    if device_type in ("cuda", "hip"):
         return StaticallyLaunchedCudaKernel(kernel)
     elif device_type == "xpu":
         return StaticallyLaunchedXpuKernel(kernel)
