@@ -101,6 +101,7 @@ SIMPLE_OPS_LIST = [
     aten.transpose,
     aten.t,
     aten.gather,
+    aten.neg,
 ]
 
 for simple_op in SIMPLE_OPS_LIST:
@@ -769,43 +770,32 @@ def conj_physical_impl(self: ComplexTensor) -> ComplexTensor:
 @register_complex(aten._conj)
 def _conj_impl(self: ComplexTensor) -> ComplexTensor:
     return ComplexTensor(
-        self._data, neg_flag=self._neg_flag, conj_flag=not self._conj_flag
+        self._data, neg_flag=self.is_neg(), conj_flag=not self.is_conj()
     )
 
 
 @register_complex(aten._neg_view)
-@register_complex(aten.neg)
 def _neg_impl(self: ComplexTensor) -> ComplexTensor:
     return ComplexTensor(
-        self._data, neg_flag=not self._neg_flag, conj_flag=self._conj_flag
+        self._data, neg_flag=not self.is_neg(), conj_flag=self.is_conj()
     )
 
 
 @register_complex(aten.resolve_conj)
 def resolve_conj_impl(self: ComplexTensor) -> ComplexTensor:
-    if not self._conj_flag:
+    if not self.is_conj():
         return self
     return ComplexTensor(
-        self._data[..., 0], -self._data[..., 1], neg_flag=self._neg_flag
+        self._data[..., 0], -self._data[..., 1], neg_flag=self.is_neg()
     )
-
-
-@register_complex(aten.is_conj)
-def is_conj_impl(self: ComplexTensor) -> bool:
-    return self._conj_flag
-
-
-@register_complex(aten.is_neg)
-def is_neg_impl(self: ComplexTensor) -> bool:
-    return self._neg_flag
 
 
 @register_complex(aten.resolve_neg)
 def resolve_neg_impl(self: ComplexTensor) -> ComplexTensor:
-    if not self._neg_flag:
+    if not self.is_neg():
         return self
     return ComplexTensor(
-        -self._data[..., 0], -self._data[..., 1], conj_flag=self._conj_flag
+        -self._data[..., 0], -self._data[..., 1], conj_flag=self.is_conj()
     )
 
 
@@ -954,25 +944,127 @@ def _dt_to_real(dt: torch.dtype | Any) -> torch.dtype | Any:
     return COMPLEX_TO_REAL[dt]
 
 
-def register_to_impl(op: OpType):
-    """Register an op similar to `aten.to`, but may have different signatures."""
+@register_complex(aten.to.dtype_layout)
+def to_dtype_layout(
+    self: ComplexTensor,
+    *,
+    dtype: torch.dtype | None,
+    device: torch.Device | None = None,
+    copy: bool = False,
+    _op=aten.to,
+    **kwargs,
+) -> ComplexTensor | torch.Tensor:
+    if device == self.device:
+        device = None
 
-    def impl(self: ComplexTensor, *args, **kwargs) -> torch.Tensor | ComplexTensor:
-        x, y = split_complex_tensor(self)
-        try:
-            args = tuple(_dt_to_real(a) for a in args)
-            kwargs = {k: _dt_to_real(v) for k, v in kwargs.items()}
-        except KeyError:
-            return op(x, *args, **kwargs)
+    if dtype == self.dtype:
+        dtype = None
 
-        return ComplexTensor(op(x, *args, **kwargs), op(y, *args, **kwargs))
+    if device is None and dtype is None and not copy:
+        return self
+    re, im = split_complex_arg(self)
+    if dtype is not None and dtype not in COMPLEX_TO_REAL:
+        return _op(re, device=device, dtype=dtype, **kwargs)
 
-    func_name = _get_func_name(op)
-    impl.__name__ = func_name
-    impl.__qualname__ = func_name
+    dtype = COMPLEX_TO_REAL.get(dtype)  # type: ignore[no-matching-overload]
+    out_re = _op(re, device=device, dtype=dtype, **kwargs)
+    out_im = _op(im, device=device, dtype=dtype, **kwargs)
 
-    return register_complex(op, impl)
+    return ComplexTensor(out_re, out_im)
 
 
-to_impl = register_to_impl(aten.to)
-_to_copy_impl = register_to_impl(aten._to_copy)
+@register_complex(aten.to.device)
+def to_device(
+    self: ComplexTensor,
+    device: torch.Device | None,
+    dtype: torch.dtype | None,
+    non_blocking: bool = False,
+    copy: bool = False,
+    memory_format: torch.memory_format | None = torch.preserve_format,
+) -> ComplexTensor | torch.Tensor:
+    return to_dtype_layout(
+        self,
+        device=device,
+        dtype=dtype,
+        non_blocking=non_blocking,
+        copy=copy,
+        memory_format=memory_format,
+    )
+
+
+@register_complex(aten.to.dtype)
+def to_dtype(
+    self: ComplexTensor,
+    dtype: torch.dtype | None,
+    non_blocking: bool = False,
+    copy: bool = False,
+    memory_format: torch.memory_format | None = torch.preserve_format,
+) -> ComplexTensor | torch.Tensor:
+    return to_dtype_layout(
+        self,
+        dtype=dtype,
+        non_blocking=non_blocking,
+        copy=copy,
+        memory_format=memory_format,
+    )
+
+
+@register_complex(aten.to.other)
+def to_other(
+    self: ComplexTensor,
+    other: torch.Tensor,
+    non_blocking: bool = False,
+    copy: bool = False,
+    memory_format: torch.memory_format | None = torch.preserve_format,
+) -> ComplexTensor | torch.Tensor:
+    return to_dtype_layout(
+        self,
+        dtype=other.dtype,
+        device=other.device,
+        non_blocking=non_blocking,
+        copy=copy,
+        memory_format=memory_format,
+    )
+
+
+@register_complex(aten._to_copy.default)
+def _to_copy_default(
+    self: ComplexTensor,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.Device | None = None,
+    pin_memory: bool = False,
+    non_blocking: bool = False,
+    memory_format: torch.memory_format | None = None,
+) -> ComplexTensor | torch.Tensor:
+    return to_dtype_layout(
+        self,
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        pin_memory=pin_memory,
+        non_blocking=non_blocking,
+        memory_format=memory_format,
+        _op=aten._to_copy,
+    )
+
+
+@register_complex(aten._to_copy.out)
+def _to_copy_out(
+    self: ComplexTensor,
+    *,
+    non_blocking: bool = False,
+    memory_format: torch.memory_format | None = None,
+    out: torch.Tensor | ComplexTensor,
+) -> ComplexTensor | torch.Tensor:
+    temp = _to_copy_default(
+        self,
+        dtype=out.dtype,
+        layout=out.layout,
+        device=out.device,
+        pin_memory=out.is_pinned(),
+        non_blocking=non_blocking,
+    )
+    out.copy_(temp)
+    return out
