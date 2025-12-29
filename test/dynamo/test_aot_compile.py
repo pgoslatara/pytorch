@@ -9,7 +9,7 @@ import pickle
 import tempfile
 import unittest
 from collections import namedtuple
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from unittest.mock import patch
 
 import torch
@@ -921,6 +921,35 @@ from user code:
             compiled_fn = torch.compile(fn, backend="eager")
             result = compiled_fn(fake_x, fake_y)
             self.assertTrue(result.fake_mode is outer_mode)
+
+    @unittest.skipIf(not TEST_CUDA, "requires cuda")
+    @torch._dynamo.config.patch("enable_aot_compile", False)
+    def test_aot_compile_joint_with_descriptors_bundled_cache(self):
+        from torch._functorch.aot_autograd import (
+            aot_compile_joint_with_descriptors,
+            aot_export_joint_with_descriptors,
+        )
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        class SimpleModule(torch.nn.Module):
+            def forward(self, x):
+                return x * 2 + 1
+
+        def simple_compiler(gm, example_inputs):
+            return gm
+
+        mod = SimpleModule().cuda()
+        fake_mode = FakeTensorMode()
+        with fake_mode:
+            fake_input = torch.randn(3, 4, device="cuda")
+            with ExitStack() as stack:
+                jd = aot_export_joint_with_descriptors(stack, mod, (fake_input,))
+                compiled_fn = aot_compile_joint_with_descriptors(
+                    jd,
+                    fw_compiler=simple_compiler,
+                    bw_compiler=simple_compiler,
+                )
+                self.assertTrue(callable(compiled_fn))
 
 
 if __name__ == "__main__":
