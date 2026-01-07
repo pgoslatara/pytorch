@@ -810,7 +810,8 @@ def _hashable_size(size: tuple) -> tuple:
     Make size tuple hashable, handling SymInt values.
 
     SymInt values are not directly hashable, so we convert them to their
-    node expression which is hashable.
+    node expression which is hashable. For NestedIntNode and other node types
+    without expr, we fall back to repr().
     """
     result = []
     for s in size:
@@ -818,7 +819,12 @@ def _hashable_size(size: tuple) -> tuple:
             result.append(s)
         elif isinstance(s, torch.SymInt):
             # Use the underlying node's expr which is hashable
-            result.append(s.node.expr)
+            # Note: NestedIntNode doesn't have expr, so we fall back to repr
+            node = s.node
+            if hasattr(node, "expr"):
+                result.append(node.expr)
+            else:
+                result.append(repr(s))
         else:
             # Fallback for any other type
             try:
