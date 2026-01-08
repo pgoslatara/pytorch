@@ -198,11 +198,7 @@ from .dicts import (
     OrderedSetVariable,
     SetVariable,
 )
-from .distributed import (
-    DeviceMeshVariable,
-    ProcessGroupVariable,
-    WorldMetaClassVariable,
-)
+from .distributed import ProcessGroupVariable, WorldMetaClassVariable
 from .functions import (
     BuiltinMethodVariable,
     CollectionsNamedTupleFunction,
@@ -1181,10 +1177,6 @@ class VariableBuilder:
         elif ProcessGroupVariable.is_process_group(value):
             self.install_guards(GuardBuilder.ID_MATCH)
             return ProcessGroupVariable(value, source=self.source)
-        elif DeviceMeshVariable.is_device_mesh(value):
-            # TODO: see if we need to add custom guard instead of a simple ID_MATCH
-            self.install_guards(GuardBuilder.EQUALS_MATCH)
-            return DeviceMeshVariable(value, source=self.source)
         elif value is OrderedSet:
             self.install_guards(GuardBuilder.ID_MATCH)
             return OrderedSetClassVariable()
@@ -3984,6 +3976,11 @@ class SourcelessBuilder:
         if isinstance(value, VariableTracker):
             # This is always valid to call, and useful for recursive calls.
             return value
+        if is_opaque_value_type(type(value)):
+            return TorchScriptObjectVariable.create(
+                value,
+                value,
+            )
         # type: ignore[attr-defined]
         elif isinstance(value, dataclasses._HAS_DEFAULT_FACTORY_CLASS):
             return UserDefinedObjectVariable(value)
@@ -4029,8 +4026,6 @@ class SourcelessBuilder:
             return SourcelessGraphModuleVariable(value)
         elif isinstance(value, torch.utils._pytree.TreeSpec):
             return UserDefinedObjectVariable(value)
-        elif DeviceMeshVariable.is_device_mesh(value):
-            return DeviceMeshVariable(value)
         elif value is functools.wraps:
             return FunctoolsWrapsVariable(value)
         elif isinstance(value, re.Pattern):
