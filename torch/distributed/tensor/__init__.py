@@ -14,6 +14,11 @@ from torch.distributed.tensor._api import (
     randn,
     zeros,
 )
+from torch.distributed.tensor._memory_sharded import (
+    distribute_storage,
+    MemoryShardedDTensor,
+    StorageShardingSpec,
+)
 from torch.distributed.tensor.placement_types import (
     Partial,
     Placement,
@@ -33,6 +38,9 @@ __all__ = [
     "DTensor",
     "distribute_tensor",
     "distribute_module",
+    "distribute_storage",
+    "MemoryShardedDTensor",
+    "StorageShardingSpec",
     "Shard",
     "Replicate",
     "Partial",
@@ -80,6 +88,9 @@ if DTensor not in _util_foreach_supported_types:
 DTensor.__module__ = "torch.distributed.tensor"
 distribute_tensor.__module__ = "torch.distributed.tensor"
 distribute_module.__module__ = "torch.distributed.tensor"
+distribute_storage.__module__ = "torch.distributed.tensor"
+MemoryShardedDTensor.__module__ = "torch.distributed.tensor"
+StorageShardingSpec.__module__ = "torch.distributed.tensor"
 ones.__module__ = "torch.distributed.tensor"
 empty.__module__ = "torch.distributed.tensor"
 full.__module__ = "torch.distributed.tensor"
