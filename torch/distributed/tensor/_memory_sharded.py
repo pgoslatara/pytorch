@@ -54,11 +54,13 @@ class MemoryShardedDTensor(DTensor):
     Attributes:
         _storage_spec: StorageShardingSpec describing the sharding configuration.
         _process_group: The process group used for collective operations.
+        _padded_local: 1D flattened tensor with padding for even all-gather.
     """
 
     _storage_spec: StorageShardingSpec
     _process_group: dist.ProcessGroup
-    __slots__ = ["_storage_spec", "_process_group"]
+    _padded_local: torch.Tensor
+    __slots__ = ["_storage_spec", "_process_group", "_padded_local"]
 
     def __new__(
         cls,
@@ -66,6 +68,7 @@ class MemoryShardedDTensor(DTensor):
         spec: "DTensor._spec",  # type: ignore[name-defined]
         storage_spec: StorageShardingSpec,
         process_group: dist.ProcessGroup,
+        padded_local: torch.Tensor,
         *,
         requires_grad: bool,
     ) -> "MemoryShardedDTensor":
@@ -78,6 +81,7 @@ class MemoryShardedDTensor(DTensor):
         )
         r._storage_spec = storage_spec
         r._process_group = process_group
+        r._padded_local = padded_local
         return r
 
     def __init__(
@@ -86,6 +90,7 @@ class MemoryShardedDTensor(DTensor):
         spec: "DTensor._spec",  # type: ignore[name-defined]
         storage_spec: StorageShardingSpec,
         process_group: dist.ProcessGroup,
+        padded_local: torch.Tensor,
         *,
         requires_grad: bool,
     ) -> None:
@@ -107,6 +112,7 @@ class MemoryShardedDTensor(DTensor):
         storage_spec: StorageShardingSpec,
         process_group: dist.ProcessGroup,
         placements: tuple,
+        padded_local: Optional[torch.Tensor] = None,
     ) -> "MemoryShardedDTensor":
         """
         Factory method to create a MemoryShardedDTensor.
@@ -117,11 +123,17 @@ class MemoryShardedDTensor(DTensor):
             storage_spec: StorageShardingSpec describing sharding configuration.
             process_group: Process group for collective operations.
             placements: DTensor placements tuple.
+            padded_local: Optional pre-computed 1D padded tensor. If None,
+                will be computed from local_tensor and storage_spec.
 
         Returns:
             A new MemoryShardedDTensor instance.
         """
         from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+
+        # Compute padded_local if not provided
+        if padded_local is None:
+            padded_local = cls._compute_padded_local(local_tensor, storage_spec)
 
         # Build DTensorSpec with the local tensor's metadata
         tensor_meta = TensorMeta(
@@ -140,6 +152,7 @@ class MemoryShardedDTensor(DTensor):
             dtensor_spec,
             storage_spec,
             process_group,
+            padded_local,
             requires_grad=local_tensor.requires_grad,
         )
 
@@ -188,13 +201,71 @@ class MemoryShardedDTensor(DTensor):
         """
         return self._process_group
 
+    @staticmethod
+    def _compute_padded_local(
+        local_tensor: torch.Tensor,
+        storage_spec: StorageShardingSpec,
+    ) -> torch.Tensor:
+        """
+        Compute the 1D padded tensor from a local shard and storage spec.
+
+        Args:
+            local_tensor: The local shard tensor.
+            storage_spec: StorageShardingSpec with padding info.
+
+        Returns:
+            1D flattened tensor, padded to padded_shard_size * other_dims.
+        """
+        actual_size = storage_spec.actual_shard_size
+        padded_size = storage_spec.padded_shard_size
+        shard_dim = storage_spec.shard_dim
+
+        # Calculate number of elements in other dimensions
+        other_dims_numel = 1
+        for i, s in enumerate(local_tensor.shape):
+            if i != shard_dim:
+                other_dims_numel *= s
+
+        # Total padded numel
+        padded_numel = padded_size * other_dims_numel
+
+        if actual_size == padded_size:
+            # No padding needed - just flatten
+            return local_tensor.view(-1)
+        else:
+            # Need to pad: create padded buffer and copy data
+            padded = local_tensor.new_zeros(padded_numel)
+            padded[: local_tensor.numel()].copy_(local_tensor.view(-1))
+            return padded
+
+    def detach(self) -> "MemoryShardedDTensor":
+        """
+        Returns a detached MemoryShardedDTensor.
+
+        This is required for nn.Parameter compatibility - the detach() method
+        must return an instance of the same type.
+
+        Returns:
+            A new MemoryShardedDTensor with detached local tensor.
+        """
+        detached_local = self._local_tensor.detach()
+        detached_padded = self._padded_local.detach()
+        return self._create(
+            local_tensor=detached_local,
+            device_mesh=self._spec.mesh,
+            storage_spec=self._storage_spec,
+            process_group=self._process_group,
+            placements=self._spec.placements,
+            padded_local=detached_padded,
+        )
+
     def _get_padded_local(self) -> torch.Tensor:
         """
-        Returns the local tensor padded to the padded_shard_size if needed.
+        Returns the local tensor padded to the padded_shard_size as ND tensor.
 
         For uneven sharding, the last rank may have a smaller shard than the
-        padded size. This method pads the local tensor with zeros to ensure
-        all ranks have the same size for the all-gather operation.
+        padded size. This method returns an ND view of the padded local tensor
+        for operations that need multi-dimensional access (like unshard).
 
         Returns:
             Local tensor padded to padded_shard_size on the shard dimension.
@@ -202,23 +273,159 @@ class MemoryShardedDTensor(DTensor):
         spec = self._storage_spec
         local_tensor = self._local_tensor
 
-        if spec.actual_shard_size == spec.padded_shard_size:
-            # No padding needed
-            return local_tensor
+        # Reshape _padded_local (1D) to ND with padded shard size
+        padded_shape = list(local_tensor.shape)
+        padded_shape[spec.shard_dim] = spec.padded_shard_size
 
-        # Need to pad the local tensor
-        shard_dim = spec.shard_dim
-        pad_size = spec.padded_shard_size - spec.actual_shard_size
+        return self._padded_local.view(padded_shape)
 
-        # Create padding shape
-        pad_shape = list(local_tensor.shape)
-        pad_shape[shard_dim] = pad_size
+    def get_all_gather_input(self, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        """
+        Returns a 1D flattened tensor suitable for all-gather collective operations.
 
-        # Create zero padding
-        padding = local_tensor.new_zeros(pad_shape)
+        This method is used by FSDP to get the input tensor for batched all-gather.
+        Returns the pre-computed padded tensor for O(1) access.
 
-        # Concatenate along shard dimension
-        return torch.cat([local_tensor, padding], dim=shard_dim)
+        Args:
+            dtype: If provided, convert the tensor to this dtype before returning.
+                   Used for mixed precision training where storage dtype differs
+                   from compute dtype.
+
+        Returns:
+            A 1D flattened plain torch.Tensor (not DTensor) containing the padded
+            local shard, suitable for passing to all-gather collectives.
+
+        Example:
+            >>> sharded = distribute_storage(dtensor, dim=0, mesh_dim="dp")
+            >>> all_gather_input = sharded.get_all_gather_input(torch.float16)
+            >>> # Use all_gather_input in batched all-gather collective
+        """
+        # _padded_local is already 1D and padded - O(1) access
+        result = self._padded_local
+
+        # Apply dtype conversion if needed
+        if dtype is not None and result.dtype != dtype:
+            result = result.to(dtype)
+
+        return result
+
+    @classmethod
+    def from_local_shard(
+        cls,
+        local_shard: torch.Tensor,
+        full_shape: torch.Size,
+        shard_dim: int,
+        device_mesh: DeviceMesh,
+        mesh_dim: int | str,
+        *,
+        requires_grad: bool = False,
+        placements: tuple | None = None,
+        padded_local: Optional[torch.Tensor] = None,
+    ) -> "MemoryShardedDTensor":
+        """
+        Create a MemoryShardedDTensor from an already-sharded local tensor.
+
+        This factory method is used by FSDP when it has already computed the
+        local shard and needs to wrap it in a MemoryShardedDTensor. Unlike
+        distribute_storage() which shards a full tensor, this method takes
+        a pre-sharded local tensor.
+
+        Args:
+            local_shard: The local shard tensor on this rank.
+            full_shape: The original (full) shape of the tensor before sharding.
+            shard_dim: The dimension along which the tensor is sharded.
+            device_mesh: The DeviceMesh for this distributed tensor.
+            mesh_dim: The mesh dimension (name or index) used for sharding.
+            requires_grad: Whether the tensor requires gradient computation.
+            placements: Optional DTensor placements tuple. If None, defaults to
+                all-Replicate placements. For TP+FSDP case, pass the combined
+                SPMD placements (e.g., (Shard(dim), Shard(dim)) for TP sharding).
+            padded_local: Optional pre-computed 1D padded tensor. If None,
+                will be computed from local_shard.
+
+        Returns:
+            A MemoryShardedDTensor wrapping the local shard.
+
+        Example:
+            >>> # FSDP has already computed the local shard
+            >>> local_shard = full_param.narrow(0, start, length).contiguous()
+            >>> sharded = MemoryShardedDTensor.from_local_shard(
+            ...     local_shard=local_shard,
+            ...     full_shape=full_param.shape,
+            ...     shard_dim=0,
+            ...     device_mesh=mesh,
+            ...     mesh_dim="dp",
+            ... )
+        """
+        from torch.distributed.tensor.placement_types import Replicate
+
+        # Resolve mesh_dim to index and name
+        if isinstance(mesh_dim, str):
+            mesh_dim_names = device_mesh.mesh_dim_names
+            if mesh_dim_names is None or mesh_dim not in mesh_dim_names:
+                raise ValueError(
+                    f"mesh_dim '{mesh_dim}' not found in device mesh. "
+                    f"Available dimensions: {mesh_dim_names}"
+                )
+            mesh_dim_name = mesh_dim
+            mesh_dim_idx = mesh_dim_names.index(mesh_dim)
+        else:
+            mesh_dim_idx = mesh_dim
+            if mesh_dim_idx < 0 or mesh_dim_idx >= device_mesh.ndim:
+                raise ValueError(
+                    f"mesh_dim {mesh_dim_idx} is out of range for mesh with "
+                    f"{device_mesh.ndim} dimensions"
+                )
+            mesh_dim_names = device_mesh.mesh_dim_names
+            mesh_dim_name = (
+                mesh_dim_names[mesh_dim_idx] if mesh_dim_names else "default"
+            )
+
+        # Get process group and world size
+        process_group = device_mesh.get_group(mesh_dim_idx)
+        world_size = device_mesh.size(mesh_dim_idx)
+
+        # Compute padded shard size from full shape
+        full_size_on_dim = full_shape[shard_dim]
+        padded_shard_size = (full_size_on_dim + world_size - 1) // world_size
+
+        # Actual shard size is the size of the local tensor on shard_dim
+        actual_shard_size = local_shard.size(shard_dim)
+
+        # Compute original stride (assume contiguous layout for full tensor)
+        orig_stride = []
+        stride = 1
+        for i in range(len(full_shape) - 1, -1, -1):
+            orig_stride.insert(0, stride)
+            stride *= full_shape[i]
+        orig_stride = tuple(orig_stride)
+
+        # Create storage sharding spec
+        storage_spec = StorageShardingSpec(
+            orig_size=full_shape,
+            orig_stride=orig_stride,
+            shard_dim=shard_dim,
+            mesh_dim=mesh_dim_name,
+            padded_shard_size=padded_shard_size,
+            actual_shard_size=actual_shard_size,
+        )
+
+        # Use provided placements or default to all-Replicate
+        if placements is None:
+            placements = tuple(Replicate() for _ in range(device_mesh.ndim))
+
+        # Ensure requires_grad is set correctly
+        if requires_grad and not local_shard.requires_grad:
+            local_shard = local_shard.requires_grad_(True)
+
+        return cls._create(
+            local_tensor=local_shard,
+            device_mesh=device_mesh,
+            storage_spec=storage_spec,
+            process_group=process_group,
+            placements=placements,
+            padded_local=padded_local,
+        )
 
     def unshard(self) -> DTensor:
         """
@@ -378,9 +585,7 @@ def distribute_storage(
 
     # Validate dim is in range
     if dim < 0 or dim >= ndim:
-        raise ValueError(
-            f"dim {dim} is out of range for tensor with {ndim} dimensions"
-        )
+        raise ValueError(f"dim {dim} is out of range for tensor with {ndim} dimensions")
 
     # Resolve mesh_dim to index if it's a string
     if isinstance(mesh_dim, str):
@@ -400,9 +605,7 @@ def distribute_storage(
                 f"{device_mesh.ndim} dimensions"
             )
         mesh_dim_names = device_mesh.mesh_dim_names
-        mesh_dim_name = (
-            mesh_dim_names[mesh_dim_idx] if mesh_dim_names else "default"
-        )
+        mesh_dim_name = mesh_dim_names[mesh_dim_idx] if mesh_dim_names else "default"
 
     # Get process group and world size for the mesh dimension
     process_group = device_mesh.get_group(mesh_dim_idx)

@@ -4,7 +4,12 @@ Tests for MemoryShardedDTensor core class functionality.
 """
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor, distribute_tensor, init_device_mesh, Replicate
+from torch.distributed.tensor import (
+    DTensor,
+    distribute_tensor,
+    init_device_mesh,
+    Replicate,
+)
 from torch.distributed.tensor._memory_sharded import (
     distribute_storage,
     MemoryShardedDTensor,
@@ -453,7 +458,9 @@ class TestDistributeStorage(DTensorTestBase):
         )
 
         full_tensor = torch.randn(8, 8, device=self.device_type)
-        dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate(), Replicate()])
+        dtensor = distribute_tensor(
+            full_tensor, device_mesh, [Replicate(), Replicate()]
+        )
 
         # Shard on dp dimension (size 2)
         msdt = distribute_storage(dtensor, dim=0, mesh_dim="dp")
@@ -531,7 +538,9 @@ class TestDistributeStorage(DTensorTestBase):
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
 
         # Create tensor with known values
-        full_tensor = torch.arange(13 * 8, device=self.device_type).reshape(13, 8).float()
+        full_tensor = (
+            torch.arange(13 * 8, device=self.device_type).reshape(13, 8).float()
+        )
         dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate()])
 
         msdt = distribute_storage(dtensor, dim=0, mesh_dim=0)
@@ -592,7 +601,9 @@ class TestUnshard(DTensorTestBase):
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
 
         # Create tensor with known values
-        full_tensor = torch.arange(16 * 8, device=self.device_type).reshape(16, 8).float()
+        full_tensor = (
+            torch.arange(16 * 8, device=self.device_type).reshape(16, 8).float()
+        )
         dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate()])
 
         msdt = distribute_storage(dtensor, dim=0, mesh_dim=0)
@@ -607,7 +618,9 @@ class TestUnshard(DTensorTestBase):
         """Test unshard on dimension 1."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
 
-        full_tensor = torch.arange(10 * 20, device=self.device_type).reshape(10, 20).float()
+        full_tensor = (
+            torch.arange(10 * 20, device=self.device_type).reshape(10, 20).float()
+        )
         dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate()])
 
         # Shard on dim 1
@@ -642,7 +655,9 @@ class TestUnshard(DTensorTestBase):
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
 
         # 13 rows: ceil(13/4) = 4 per shard, ranks get 4, 4, 4, 1
-        full_tensor = torch.arange(13 * 8, device=self.device_type).reshape(13, 8).float()
+        full_tensor = (
+            torch.arange(13 * 8, device=self.device_type).reshape(13, 8).float()
+        )
         dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate()])
 
         msdt = distribute_storage(dtensor, dim=0, mesh_dim=0)
@@ -660,7 +675,9 @@ class TestUnshard(DTensorTestBase):
         """Test unshard with 3D tensor."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
 
-        full_tensor = torch.arange(8 * 4 * 6, device=self.device_type).reshape(8, 4, 6).float()
+        full_tensor = (
+            torch.arange(8 * 4 * 6, device=self.device_type).reshape(8, 4, 6).float()
+        )
         dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate()])
 
         # Shard on middle dimension
@@ -770,6 +787,266 @@ class TestEdgeCases(DTensorTestBase):
         self.assertTrue(msdt.local().is_contiguous())
 
 
+class TestFSDPIntegration(DTensorTestBase):
+    """Tests for FSDP integration methods."""
+
+    @property
+    def world_size(self) -> int:
+        return 4
+
+    @with_comms
+    def test_get_all_gather_input_basic(self):
+        """Test get_all_gather_input returns 1D flattened tensor."""
+        device_mesh = init_device_mesh(self.device_type, (self.world_size,))
+
+        full_tensor = torch.randn(16, 8, device=self.device_type)
+        dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate()])
+
+        msdt = distribute_storage(dtensor, dim=0, mesh_dim=0)
+
+        # Get all-gather input
+        all_gather_input = msdt.get_all_gather_input()
+
+        # Should be a plain tensor (not DTensor)
+        self.assertIsInstance(all_gather_input, torch.Tensor)
+        self.assertNotIsInstance(all_gather_input, DTensor)
+
+        # Should be 1D
+        self.assertEqual(all_gather_input.ndim, 1)
+
+        # Should have correct size (4 rows * 8 cols = 32 elements per shard)
+        self.assertEqual(all_gather_input.numel(), 4 * 8)
+
+    @with_comms
+    def test_get_all_gather_input_dtype_conversion(self):
+        """Test get_all_gather_input with dtype conversion."""
+        device_mesh = init_device_mesh(self.device_type, (self.world_size,))
+
+        # Create float32 tensor
+        full_tensor = torch.randn(16, 8, device=self.device_type, dtype=torch.float32)
+        dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate()])
+
+        msdt = distribute_storage(dtensor, dim=0, mesh_dim=0)
+
+        # Get all-gather input with float16 dtype
+        all_gather_input = msdt.get_all_gather_input(dtype=torch.float16)
+
+        self.assertEqual(all_gather_input.dtype, torch.float16)
+
+    @with_comms
+    def test_get_all_gather_input_preserves_dtype(self):
+        """Test get_all_gather_input preserves dtype when None."""
+        device_mesh = init_device_mesh(self.device_type, (self.world_size,))
+
+        full_tensor = torch.randn(16, 8, device=self.device_type, dtype=torch.bfloat16)
+        dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate()])
+
+        msdt = distribute_storage(dtensor, dim=0, mesh_dim=0)
+
+        all_gather_input = msdt.get_all_gather_input()
+
+        self.assertEqual(all_gather_input.dtype, torch.bfloat16)
+
+    @with_comms
+    def test_get_all_gather_input_uneven_sharding(self):
+        """Test get_all_gather_input with uneven sharding (pads correctly)."""
+        device_mesh = init_device_mesh(self.device_type, (self.world_size,))
+
+        # 13 rows, 4 ranks: ceil(13/4) = 4 padded shard size
+        # Ranks get: 4, 4, 4, 1 rows
+        full_tensor = torch.randn(13, 8, device=self.device_type)
+        dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate()])
+
+        msdt = distribute_storage(dtensor, dim=0, mesh_dim=0)
+
+        all_gather_input = msdt.get_all_gather_input()
+
+        rank = dist.get_rank()
+        # All ranks should return padded size (4 * 8 = 32 elements)
+        # to ensure all-gather works correctly
+        self.assertEqual(all_gather_input.numel(), 4 * 8)
+
+        if rank == 3:
+            # Last rank only has 1 actual row, rest is padding
+            self.assertEqual(msdt.size(0), 1)
+
+    @with_comms
+    def test_from_local_shard_basic(self):
+        """Test from_local_shard creates correct MemoryShardedDTensor."""
+        device_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("dp",)
+        )
+
+        # Create a local shard as FSDP would
+        local_shard = torch.randn(4, 8, device=self.device_type)
+        full_shape = torch.Size([16, 8])
+
+        msdt = MemoryShardedDTensor.from_local_shard(
+            local_shard=local_shard,
+            full_shape=full_shape,
+            shard_dim=0,
+            device_mesh=device_mesh,
+            mesh_dim="dp",
+        )
+
+        self.assertIsInstance(msdt, MemoryShardedDTensor)
+        self.assertEqual(msdt.shape, torch.Size([4, 8]))
+        self.assertEqual(msdt.full_shape, torch.Size([16, 8]))
+        self.assertEqual(msdt.storage_spec.shard_dim, 0)
+        self.assertEqual(msdt.storage_spec.mesh_dim, "dp")
+
+    @with_comms
+    def test_from_local_shard_with_mesh_dim_index(self):
+        """Test from_local_shard with mesh_dim as index."""
+        device_mesh = init_device_mesh(self.device_type, (self.world_size,))
+
+        local_shard = torch.randn(4, 8, device=self.device_type)
+        full_shape = torch.Size([16, 8])
+
+        msdt = MemoryShardedDTensor.from_local_shard(
+            local_shard=local_shard,
+            full_shape=full_shape,
+            shard_dim=0,
+            device_mesh=device_mesh,
+            mesh_dim=0,  # Use index instead of name
+        )
+
+        self.assertIsInstance(msdt, MemoryShardedDTensor)
+        self.assertEqual(msdt.full_shape, torch.Size([16, 8]))
+
+    @with_comms
+    def test_from_local_shard_uneven(self):
+        """Test from_local_shard with uneven sharding (last rank smaller)."""
+        device_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("dp",)
+        )
+
+        rank = dist.get_rank()
+        # Simulate FSDP's uneven sharding: 13 / 4 = 4, 4, 4, 1
+        if rank < 3:
+            local_shard = torch.randn(4, 8, device=self.device_type)
+        else:
+            local_shard = torch.randn(1, 8, device=self.device_type)
+
+        full_shape = torch.Size([13, 8])
+
+        msdt = MemoryShardedDTensor.from_local_shard(
+            local_shard=local_shard,
+            full_shape=full_shape,
+            shard_dim=0,
+            device_mesh=device_mesh,
+            mesh_dim="dp",
+        )
+
+        self.assertEqual(msdt.full_shape, torch.Size([13, 8]))
+        self.assertEqual(msdt.storage_spec.padded_shard_size, 4)
+
+        if rank < 3:
+            self.assertEqual(msdt.size(0), 4)
+            self.assertEqual(msdt.storage_spec.actual_shard_size, 4)
+        else:
+            self.assertEqual(msdt.size(0), 1)
+            self.assertEqual(msdt.storage_spec.actual_shard_size, 1)
+
+    @with_comms
+    def test_from_local_shard_requires_grad(self):
+        """Test from_local_shard respects requires_grad."""
+        device_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("dp",)
+        )
+
+        local_shard = torch.randn(4, 8, device=self.device_type)
+        full_shape = torch.Size([16, 8])
+
+        # With requires_grad=True
+        msdt = MemoryShardedDTensor.from_local_shard(
+            local_shard=local_shard,
+            full_shape=full_shape,
+            shard_dim=0,
+            device_mesh=device_mesh,
+            mesh_dim="dp",
+            requires_grad=True,
+        )
+        self.assertTrue(msdt.requires_grad)
+
+        # With requires_grad=False (default) - create fresh tensor
+        local_shard_no_grad = torch.randn(4, 8, device=self.device_type)
+        msdt_no_grad = MemoryShardedDTensor.from_local_shard(
+            local_shard=local_shard_no_grad,
+            full_shape=full_shape,
+            shard_dim=0,
+            device_mesh=device_mesh,
+            mesh_dim="dp",
+            requires_grad=False,
+        )
+        self.assertFalse(msdt_no_grad.requires_grad)
+
+    @with_comms
+    def test_from_local_shard_roundtrip(self):
+        """Test from_local_shard followed by unshard recovers correct data."""
+        device_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("dp",)
+        )
+
+        # Create known full tensor and manually compute shards
+        full_tensor = (
+            torch.arange(16 * 8, device=self.device_type).reshape(16, 8).float()
+        )
+
+        rank = dist.get_rank()
+        start_idx = rank * 4
+        end_idx = start_idx + 4
+        local_shard = full_tensor[start_idx:end_idx].contiguous()
+
+        msdt = MemoryShardedDTensor.from_local_shard(
+            local_shard=local_shard,
+            full_shape=torch.Size([16, 8]),
+            shard_dim=0,
+            device_mesh=device_mesh,
+            mesh_dim="dp",
+        )
+
+        # Unshard and verify data matches original
+        unsharded = msdt.unshard()
+        self.assertTrue(torch.equal(unsharded.to_local(), full_tensor))
+
+    @with_comms
+    def test_from_local_shard_invalid_mesh_dim_name(self):
+        """Test from_local_shard raises error for invalid mesh_dim name."""
+        device_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("dp",)
+        )
+
+        local_shard = torch.randn(4, 8, device=self.device_type)
+        full_shape = torch.Size([16, 8])
+
+        with self.assertRaises(ValueError):
+            MemoryShardedDTensor.from_local_shard(
+                local_shard=local_shard,
+                full_shape=full_shape,
+                shard_dim=0,
+                device_mesh=device_mesh,
+                mesh_dim="invalid_name",
+            )
+
+    @with_comms
+    def test_from_local_shard_invalid_mesh_dim_index(self):
+        """Test from_local_shard raises error for invalid mesh_dim index."""
+        device_mesh = init_device_mesh(self.device_type, (self.world_size,))
+
+        local_shard = torch.randn(4, 8, device=self.device_type)
+        full_shape = torch.Size([16, 8])
+
+        with self.assertRaises(ValueError):
+            MemoryShardedDTensor.from_local_shard(
+                local_shard=local_shard,
+                full_shape=full_shape,
+                shard_dim=0,
+                device_mesh=device_mesh,
+                mesh_dim=5,  # Out of range
+            )
+
+
 class TestIntegration(DTensorTestBase):
     """Integration tests for MemoryShardedDTensor."""
 
@@ -782,7 +1059,9 @@ class TestIntegration(DTensorTestBase):
         """Test distribute_storage -> unshard roundtrip on dim 0."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
 
-        full_tensor = torch.arange(16 * 8, device=self.device_type).reshape(16, 8).float()
+        full_tensor = (
+            torch.arange(16 * 8, device=self.device_type).reshape(16, 8).float()
+        )
         dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate()])
 
         # Shard
@@ -801,7 +1080,9 @@ class TestIntegration(DTensorTestBase):
         """Test distribute_storage -> unshard roundtrip on dim 1."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
 
-        full_tensor = torch.arange(8 * 16, device=self.device_type).reshape(8, 16).float()
+        full_tensor = (
+            torch.arange(8 * 16, device=self.device_type).reshape(8, 16).float()
+        )
         dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate()])
 
         # Shard on dim 1
@@ -820,7 +1101,9 @@ class TestIntegration(DTensorTestBase):
         """Test that unshard can be called multiple times."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
 
-        full_tensor = torch.arange(16 * 8, device=self.device_type).reshape(16, 8).float()
+        full_tensor = (
+            torch.arange(16 * 8, device=self.device_type).reshape(16, 8).float()
+        )
         dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate()])
 
         msdt = distribute_storage(dtensor, dim=0, mesh_dim=0)
@@ -841,7 +1124,9 @@ class TestIntegration(DTensorTestBase):
         )
 
         full_tensor = torch.arange(8 * 8, device=self.device_type).reshape(8, 8).float()
-        dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate(), Replicate()])
+        dtensor = distribute_tensor(
+            full_tensor, device_mesh, [Replicate(), Replicate()]
+        )
 
         # Shard on "data_parallel" dimension
         msdt = distribute_storage(dtensor, dim=0, mesh_dim="data_parallel")
@@ -861,7 +1146,9 @@ class TestIntegration(DTensorTestBase):
 
         # 15 rows, 4 ranks: ceil(15/4) = 4 per shard
         # Ranks get: 4, 4, 4, 3
-        full_tensor = torch.arange(15 * 8, device=self.device_type).reshape(15, 8).float()
+        full_tensor = (
+            torch.arange(15 * 8, device=self.device_type).reshape(15, 8).float()
+        )
         dtensor = distribute_tensor(full_tensor, device_mesh, [Replicate()])
 
         msdt = distribute_storage(dtensor, dim=0, mesh_dim=0)
